@@ -55,7 +55,7 @@ func main() {
 		os.Exit(1)
 	}
 	// 自定义头：Lang: zh_CN pl th en ...
-	req.Header.Set("Lang", lan)
+	req.Header.Set("Lang", *lan)
 	// 一些通用头
 	req.Header.Set("User-Agent", "Go-HTTP-Client/1.1 (+lang=zh_CN)")
 	req.Header.Set("Accept", "*/*")
