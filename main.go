@@ -1,224 +1,121 @@
 package main
 
 import (
-	"encoding/json"
+	"context"
 	"flag"
 	"fmt"
-	"log"
-	"net"
+	"io"
 	"net/http"
+	"net/http/httptrace"
 	"os"
 	"strings"
 	"time"
-
-	"github.com/gorilla/websocket"
 )
-
-var (
-	defaultPort = getEnv("PORT", "8080")
-	addr        = flag.String("addr", ":"+defaultPort, "http service address")
-)
-
-// WebSocket 升级器（开发环境允许任意 Origin；生产请按需校验）
-var upgrader = websocket.Upgrader{
-	ReadBufferSize:  4096,
-	WriteBufferSize: 4096,
-	// 注意：生产环境请替换为严格的 Origin 校验
-	CheckOrigin: func(r *http.Request) bool { return true },
-	// 可选：从客户端提供的协议中选择（如果需要）
-	// Subprotocols: []string{"json", "binary"},
-}
 
 func main() {
+	url := flag.String("url", "", "请求的完整 URL（必填）")
+	lan := flag.String("lan", "", "请求头        （必填）")
+	timeout := flag.Duration("timeout", 15*time.Second, "请求超时")
+	maxBody := flag.Int64("max-body", 2<<20, "打印 body 的最大字节数（默认 2MB）")
 	flag.Parse()
 
-	http.HandleFunc("/ws", wsHandler)
-	http.HandleFunc("/", homeHandler)
-
-	log.Printf("WebSocket echo server listening on %s  (ws://127.0.0.1%s/ws)\n", *addr, *addr)
-	if err := http.ListenAndServe(*addr, nil); err != nil {
-		log.Fatal("ListenAndServe:", err)
+	if strings.TrimSpace(*url) == "" {
+		fmt.Fprintln(os.Stderr, "用法：go run main.go -url https://example.com/path?foo=bar")
+		os.Exit(2)
 	}
-}
 
-func wsHandler(w http.ResponseWriter, r *http.Request) {
-	// —— 连接参数打印（在升级前就能拿到完整的 HTTP 请求）——
-	now := time.Now().Format(time.RFC3339)
-	remoteIP, remotePort := splitHostPort(r.RemoteAddr)
-	forwardedFor := r.Header.Get("X-Forwarded-For")
-	realIP := r.Header.Get("X-Real-IP")
-	origin := r.Header.Get("Origin")
-	ua := r.Header.Get("User-Agent")
-	subprotoRequested := r.Header.Values("Sec-WebSocket-Protocol")
+	// 记录时间
+	start := time.Now()
 
-	// Query 参数
-	query := r.URL.Query()
-
-	// 全量 Header（便于排查）
-	headerJSON, _ := json.MarshalIndent(r.Header, "", "  ")
-
-	// Cookies
-	cookies := make(map[string]string)
-	for _, c := range r.Cookies() {
-		cookies[c.Name] = c.Value
-	}
-	cookieJSON, _ := json.MarshalIndent(cookies, "", "  ")
-
-	log.Printf(
-		"\n==== New WebSocket connection @ %s ====\n"+
-			"RequestURI: %s\nPath: %s\nRawQuery: %s\n"+
-			"RemoteAddr: %s (ip=%s, port=%s)\nX-Forwarded-For: %s\nX-Real-IP: %s\n"+
-			"Origin: %s\nUser-Agent: %s\n"+
-			"Subprotocols (requested): %v\n"+
-			"Query: %v\nHeaders:\n%s\nCookies:\n%s\n",
-		now, r.RequestURI, r.URL.Path, r.URL.RawQuery,
-		r.RemoteAddr, remoteIP, remotePort, forwardedFor, realIP,
-		origin, ua, subprotoRequested, query, string(headerJSON), string(cookieJSON),
+	// 准备上下文和 httptrace（可观测 DNS、连接等，可选）
+	var (
+		dnsStart, connStart time.Time
 	)
+	trace := &httptrace.ClientTrace{
+		DNSStart: func(info httptrace.DNSStartInfo) { dnsStart = time.Now() },
+		DNSDone: func(info httptrace.DNSDoneInfo) {
+			if !dnsStart.IsZero() {
+				fmt.Printf("DNS 解析耗时：%v\n", time.Since(dnsStart))
+			}
+		},
+		ConnectStart: func(network, addr string) { connStart = time.Now() },
+		ConnectDone: func(network, addr string, err error) {
+			if !connStart.IsZero() {
+				fmt.Printf("TCP 连接耗时：%v（目标：%s）\n", time.Since(connStart), addr)
+			}
+		},
+	}
+	ctx, cancel := context.WithTimeout(httptrace.WithClientTrace(context.Background(), trace), *timeout)
+	defer cancel()
 
-	// —— 升级为 WebSocket —— //
-	conn, err := upgrader.Upgrade(w, r, nil)
+	// 构建请求
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, *url, nil)
 	if err != nil {
-		log.Printf("upgrade error: %v", err)
-		return
+		fmt.Fprintf(os.Stderr, "构建请求失败：%v\n", err)
+		os.Exit(1)
 	}
-	defer conn.Close()
+	// 自定义头：Lang: zh_CN pl th en ...
+	req.Header.Set("Lang", lan)
+	// 一些通用头
+	req.Header.Set("User-Agent", "Go-HTTP-Client/1.1 (+lang=zh_CN)")
+	req.Header.Set("Accept", "*/*")
 
-	// 记录最终选中的子协议
-	if sp := conn.Subprotocol(); sp != "" {
-		log.Printf("Subprotocol (selected): %s", sp)
-	}
-
-	// 心跳与超时（可根据需要调整）
-	conn.SetReadLimit(1 << 20) // 1MB
-	conn.SetReadDeadline(time.Now().Add(60 * time.Second))
-	conn.SetPongHandler(func(string) error {
-		// 收到 pong 后延长读超时
-		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
-		return nil
-	})
-
-	// 定时发送 ping 保活
-	pingTicker := time.NewTicker(30 * time.Second)
-	defer pingTicker.Stop()
-
-	// 写协程（只负责发送 ping）
-	writeErrCh := make(chan error, 1)
-	go func() {
-		for range pingTicker.C {
-			if err := conn.WriteControl(websocket.PingMessage, []byte("ping"), time.Now().Add(5*time.Second)); err != nil {
-				writeErrCh <- fmt.Errorf("write ping error: %w", err)
-				return
+	// 自定义 Client：跟随最多 10 次重定向，并打印重定向信息
+	client := &http.Client{
+		Timeout: *timeout,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) > 0 {
+				fmt.Printf("重定向 #%d → %s\n", len(via), req.URL.String())
 			}
-		}
-	}()
-
-	// 读循环 + 回显
-	for {
-		select {
-		case err := <-writeErrCh:
-			log.Printf("writer goroutine exit: %v", err)
-			return
-		default:
-			mt, msg, err := conn.ReadMessage()
-			if err != nil {
-				// 常见：客户端正常关闭会出现 CloseError
-				if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
-					log.Printf("client closed: %v", err)
-				} else {
-					log.Printf("read error: %v", err)
-				}
-				return
+			if len(via) >= 10 {
+				return fmt.Errorf("重定向过多")
 			}
-
-			// 打印消息（文本过长时可截断）
-			preview := string(msg)
-			if len(preview) > 512 {
-				preview = preview[:512] + "...(truncated)"
-			}
-			log.Printf("recv message: type=%s len=%d preview=%q",
-				messageTypeName(mt), len(msg), preview)
-
-			// 原样回显
-			if err := conn.WriteMessage(mt, msg); err != nil {
-				log.Printf("write error: %v", err)
-				return
-			}
-		}
+			return nil
+		},
 	}
-}
 
-// 提供一个简单的测试页面： http://localhost:8080/
-func homeHandler(w http.ResponseWriter, r *http.Request) {
-	host := r.Host
-	if strings.HasPrefix(host, "[::]") || strings.HasPrefix(host, "0.0.0.0") {
-		host = "127.0.0.1" + strings.TrimPrefix(host, "0.0.0.0")
-	}
-	html := `<!doctype html>
-<html>
-<head><meta charset="utf-8"><title>WS Echo Test</title></head>
-<body>
-<h3>WebSocket Echo Test</h3>
-<p>连接示例：<code>ws://` + host + `/ws?uid=123&token=abc</code></p>
-<input id="qs" style="width: 420px" value="uid=123&token=abc">
-<button onclick="connect()">Connect</button>
-<div id="status"></div>
-<hr/>
-<input id="msg" style="width: 420px" value="hello">
-<button onclick="sendMsg()">Send</button>
-<pre id="log"></pre>
-<script>
-let ws;
-function connect() {
-  const qs = document.getElementById('qs').value;
-  const url = 'ws://' + location.host + '/ws' + (qs ? '?' + qs : '');
-  ws = new WebSocket(url, ['json']); // 测试子协议
-  ws.onopen = () => log('open');
-  ws.onmessage = ev => log('recv: ' + ev.data);
-  ws.onclose = ev => log('close: code=' + ev.code + ' reason=' + ev.reason);
-  ws.onerror = ev => log('error');
-}
-function sendMsg() {
-  if (!ws || ws.readyState !== 1) return log('not open');
-  const v = document.getElementById('msg').value;
-  ws.send(v);
-}
-function log(s){ document.getElementById('log').textContent += s + '\n'; }
-</script>
-</body>
-</html>`
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = w.Write([]byte(html))
-}
-
-func messageTypeName(mt int) string {
-	switch mt {
-	case websocket.TextMessage:
-		return "Text"
-	case websocket.BinaryMessage:
-		return "Binary"
-	case websocket.CloseMessage:
-		return "Close"
-	case websocket.PingMessage:
-		return "Ping"
-	case websocket.PongMessage:
-		return "Pong"
-	default:
-		return fmt.Sprintf("Unknown(%d)", mt)
-	}
-}
-
-func splitHostPort(remote string) (ip, port string) {
-	host, p, err := net.SplitHostPort(remote)
+	// 发送请求
+	resp, err := client.Do(req)
 	if err != nil {
-		return remote, ""
+		fmt.Fprintf(os.Stderr, "请求失败：%v\n", err)
+		os.Exit(1)
 	}
-	return host, p
-}
+	defer resp.Body.Close()
 
-func getEnv(k, def string) string {
-	if v := os.Getenv(k); v != "" {
-		return v
+	// 打印基础信息
+	fmt.Println("====== 请求信息 ======")
+	fmt.Printf("方法：%s\n", req.Method)
+	fmt.Printf("初始 URL：%s\n", *url)
+	fmt.Printf("已发送请求头：\n")
+	for k, v := range req.Header {
+		fmt.Printf("  %s: %s\n", k, strings.Join(v, ", "))
 	}
-	return def
+
+	fmt.Println("\n====== 响应信息 ======")
+	fmt.Printf("最终 URL：%s\n", resp.Request.URL.String())
+	fmt.Printf("协议版本：%s\n", resp.Proto)
+	fmt.Printf("状态码：%d %s\n", resp.StatusCode, http.StatusText(resp.StatusCode))
+	if resp.ContentLength >= 0 {
+		fmt.Printf("Content-Length：%d\n", resp.ContentLength)
+	} else {
+		fmt.Printf("Content-Length：未知（分块传输或未提供）\n")
+	}
+
+	fmt.Printf("\n响应头：\n")
+	for k, v := range resp.Header {
+		fmt.Printf("  %s: %s\n", k, strings.Join(v, ", "))
+	}
+
+	// 读取并打印 body（限制最大字节数，避免刷屏）
+	fmt.Println("\n====== 响应 Body（可能已截断） ======")
+	limited := io.LimitReader(resp.Body, *maxBody)
+	n, err := io.Copy(os.Stdout, limited)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "\n读取 body 出错：%v\n", err)
+	}
+	if n == *maxBody {
+		fmt.Fprintf(os.Stderr, "\n\n[提示] 输出已达到 max-body=%d 字节的上限，可能已截断。\n", *maxBody)
+	}
+
+	fmt.Printf("\n====== 用时 ======\n总耗时：%v\n", time.Since(start))
 }
