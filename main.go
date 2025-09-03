@@ -1,188 +1,224 @@
 package main
 
 import (
-	"bufio"
-	"crypto/sha1"
-	"encoding/base64"
-	"encoding/binary"
 	"encoding/json"
-	"io"
+	"flag"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
+	"os"
+	"strings"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
-// logRequest prints request details
-func logRequest(r *http.Request) {
-	log.Printf("%s %s", r.Method, r.URL.String())
-	headers, _ := json.MarshalIndent(r.Header, "", "  ")
-	log.Printf("Headers: %s", headers)
-	if r.ContentLength > 0 {
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			log.Printf("Error reading body: %v", err)
-		} else {
-			log.Printf("Body: %s", string(body))
-		}
+var (
+	defaultPort = getEnv("PORT", "8080")
+	addr        = flag.String("addr", ":"+defaultPort, "http service address")
+)
+
+// WebSocket 升级器（开发环境允许任意 Origin；生产请按需校验）
+var upgrader = websocket.Upgrader{
+	ReadBufferSize:  4096,
+	WriteBufferSize: 4096,
+	// 注意：生产环境请替换为严格的 Origin 校验
+	CheckOrigin: func(r *http.Request) bool { return true },
+	// 可选：从客户端提供的协议中选择（如果需要）
+	// Subprotocols: []string{"json", "binary"},
+}
+
+func main() {
+	flag.Parse()
+
+	http.HandleFunc("/ws", wsHandler)
+	http.HandleFunc("/", homeHandler)
+
+	log.Printf("WebSocket echo server listening on %s  (ws://127.0.0.1%s/ws)\n", *addr, *addr)
+	if err := http.ListenAndServe(*addr, nil); err != nil {
+		log.Fatal("ListenAndServe:", err)
 	}
-}
-
-func httpHandler(w http.ResponseWriter, r *http.Request) {
-	logRequest(r)
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte("ok"))
-}
-
-func computeAcceptKey(key string) string {
-	const magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-	h := sha1.New()
-	h.Write([]byte(key + magic))
-	return base64.StdEncoding.EncodeToString(h.Sum(nil))
 }
 
 func wsHandler(w http.ResponseWriter, r *http.Request) {
-	logRequest(r)
-	if r.Header.Get("Upgrade") != "websocket" {
-		http.Error(w, "upgrade required", http.StatusBadRequest)
-		return
-	}
-	key := r.Header.Get("Sec-WebSocket-Key")
-	if key == "" {
-		http.Error(w, "missing websocket key", http.StatusBadRequest)
-		return
-	}
+	// —— 连接参数打印（在升级前就能拿到完整的 HTTP 请求）——
+	now := time.Now().Format(time.RFC3339)
+	remoteIP, remotePort := splitHostPort(r.RemoteAddr)
+	forwardedFor := r.Header.Get("X-Forwarded-For")
+	realIP := r.Header.Get("X-Real-IP")
+	origin := r.Header.Get("Origin")
+	ua := r.Header.Get("User-Agent")
+	subprotoRequested := r.Header.Values("Sec-WebSocket-Protocol")
 
-	hijacker, ok := w.(http.Hijacker)
-	if !ok {
-		http.Error(w, "hijacking not supported", http.StatusInternalServerError)
-		return
+	// Query 参数
+	query := r.URL.Query()
+
+	// 全量 Header（便于排查）
+	headerJSON, _ := json.MarshalIndent(r.Header, "", "  ")
+
+	// Cookies
+	cookies := make(map[string]string)
+	for _, c := range r.Cookies() {
+		cookies[c.Name] = c.Value
 	}
-	conn, buf, err := hijacker.Hijack()
+	cookieJSON, _ := json.MarshalIndent(cookies, "", "  ")
+
+	log.Printf(
+		"\n==== New WebSocket connection @ %s ====\n"+
+			"RequestURI: %s\nPath: %s\nRawQuery: %s\n"+
+			"RemoteAddr: %s (ip=%s, port=%s)\nX-Forwarded-For: %s\nX-Real-IP: %s\n"+
+			"Origin: %s\nUser-Agent: %s\n"+
+			"Subprotocols (requested): %v\n"+
+			"Query: %v\nHeaders:\n%s\nCookies:\n%s\n",
+		now, r.RequestURI, r.URL.Path, r.URL.RawQuery,
+		r.RemoteAddr, remoteIP, remotePort, forwardedFor, realIP,
+		origin, ua, subprotoRequested, query, string(headerJSON), string(cookieJSON),
+	)
+
+	// —— 升级为 WebSocket —— //
+	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		http.Error(w, "hijack error", http.StatusInternalServerError)
+		log.Printf("upgrade error: %v", err)
 		return
 	}
 	defer conn.Close()
 
-	accept := computeAcceptKey(key)
-	response := "HTTP/1.1 101 Switching Protocols\r\n" +
-		"Upgrade: websocket\r\n" +
-		"Connection: Upgrade\r\n" +
-		"Sec-WebSocket-Accept: " + accept + "\r\n\r\n"
-	if _, err := conn.Write([]byte(response)); err != nil {
-		return
+	// 记录最终选中的子协议
+	if sp := conn.Subprotocol(); sp != "" {
+		log.Printf("Subprotocol (selected): %s", sp)
 	}
 
-	readLoop(conn, buf.Reader)
-}
+	// 心跳与超时（可根据需要调整）
+	conn.SetReadLimit(1 << 20) // 1MB
+	conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	conn.SetPongHandler(func(string) error {
+		// 收到 pong 后延长读超时
+		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		return nil
+	})
 
-func readLoop(conn net.Conn, r *bufio.Reader) {
-	for {
-		op, payload, err := readFrame(r)
-		if err != nil {
-			if err != io.EOF {
-				log.Printf("WS read error: %v", err)
+	// 定时发送 ping 保活
+	pingTicker := time.NewTicker(30 * time.Second)
+	defer pingTicker.Stop()
+
+	// 写协程（只负责发送 ping）
+	writeErrCh := make(chan error, 1)
+	go func() {
+		for range pingTicker.C {
+			if err := conn.WriteControl(websocket.PingMessage, []byte("ping"), time.Now().Add(5*time.Second)); err != nil {
+				writeErrCh <- fmt.Errorf("write ping error: %w", err)
+				return
 			}
-			return
 		}
-		log.Printf("WS recv (%d): %s", op, string(payload))
-		if err := writeFrame(conn, op, payload); err != nil {
-			log.Printf("WS write error: %v", err)
+	}()
+
+	// 读循环 + 回显
+	for {
+		select {
+		case err := <-writeErrCh:
+			log.Printf("writer goroutine exit: %v", err)
 			return
+		default:
+			mt, msg, err := conn.ReadMessage()
+			if err != nil {
+				// 常见：客户端正常关闭会出现 CloseError
+				if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+					log.Printf("client closed: %v", err)
+				} else {
+					log.Printf("read error: %v", err)
+				}
+				return
+			}
+
+			// 打印消息（文本过长时可截断）
+			preview := string(msg)
+			if len(preview) > 512 {
+				preview = preview[:512] + "...(truncated)"
+			}
+			log.Printf("recv message: type=%s len=%d preview=%q",
+				messageTypeName(mt), len(msg), preview)
+
+			// 原样回显
+			if err := conn.WriteMessage(mt, msg); err != nil {
+				log.Printf("write error: %v", err)
+				return
+			}
 		}
 	}
 }
 
-func readFrame(r *bufio.Reader) (byte, []byte, error) {
-	var header [2]byte
-	if _, err := io.ReadFull(r, header[:]); err != nil {
-		return 0, nil, err
+// 提供一个简单的测试页面： http://localhost:8080/
+func homeHandler(w http.ResponseWriter, r *http.Request) {
+	host := r.Host
+	if strings.HasPrefix(host, "[::]") || strings.HasPrefix(host, "0.0.0.0") {
+		host = "127.0.0.1" + strings.TrimPrefix(host, "0.0.0.0")
 	}
-	fin := header[0] & 0x80
-	op := header[0] & 0x0F
-	masked := header[1] & 0x80
-	length := int(header[1] & 0x7F)
-
-	switch length {
-	case 126:
-		var ext [2]byte
-		if _, err := io.ReadFull(r, ext[:]); err != nil {
-			return 0, nil, err
-		}
-		length = int(binary.BigEndian.Uint16(ext[:]))
-	case 127:
-		var ext [8]byte
-		if _, err := io.ReadFull(r, ext[:]); err != nil {
-			return 0, nil, err
-		}
-		length = int(binary.BigEndian.Uint64(ext[:]))
-	}
-
-	var mask [4]byte
-	if masked != 0 {
-		if _, err := io.ReadFull(r, mask[:]); err != nil {
-			return 0, nil, err
-		}
-	}
-
-	payload := make([]byte, length)
-	if _, err := io.ReadFull(r, payload); err != nil {
-		return 0, nil, err
-	}
-	if masked != 0 {
-		for i := 0; i < length; i++ {
-			payload[i] ^= mask[i%4]
-		}
-	}
-	if fin == 0 {
-		return 0, nil, io.EOF // fragmented frames not supported
-	}
-	return op, payload, nil
+	html := `<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>WS Echo Test</title></head>
+<body>
+<h3>WebSocket Echo Test</h3>
+<p>连接示例：<code>ws://` + host + `/ws?uid=123&token=abc</code></p>
+<input id="qs" style="width: 420px" value="uid=123&token=abc">
+<button onclick="connect()">Connect</button>
+<div id="status"></div>
+<hr/>
+<input id="msg" style="width: 420px" value="hello">
+<button onclick="sendMsg()">Send</button>
+<pre id="log"></pre>
+<script>
+let ws;
+function connect() {
+  const qs = document.getElementById('qs').value;
+  const url = 'ws://' + location.host + '/ws' + (qs ? '?' + qs : '');
+  ws = new WebSocket(url, ['json']); // 测试子协议
+  ws.onopen = () => log('open');
+  ws.onmessage = ev => log('recv: ' + ev.data);
+  ws.onclose = ev => log('close: code=' + ev.code + ' reason=' + ev.reason);
+  ws.onerror = ev => log('error');
+}
+function sendMsg() {
+  if (!ws || ws.readyState !== 1) return log('not open');
+  const v = document.getElementById('msg').value;
+  ws.send(v);
+}
+function log(s){ document.getElementById('log').textContent += s + '\n'; }
+</script>
+</body>
+</html>`
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write([]byte(html))
 }
 
-func writeFrame(w io.Writer, op byte, payload []byte) error {
-	header := []byte{0x80 | op, 0}
-	length := len(payload)
-	switch {
-	case length < 126:
-		header[1] = byte(length)
-	case length <= 65535:
-		header[1] = 126
-		ext := make([]byte, 2)
-		binary.BigEndian.PutUint16(ext, uint16(length))
-		header = append(header, ext...)
+func messageTypeName(mt int) string {
+	switch mt {
+	case websocket.TextMessage:
+		return "Text"
+	case websocket.BinaryMessage:
+		return "Binary"
+	case websocket.CloseMessage:
+		return "Close"
+	case websocket.PingMessage:
+		return "Ping"
+	case websocket.PongMessage:
+		return "Pong"
 	default:
-		header[1] = 127
-		ext := make([]byte, 8)
-		binary.BigEndian.PutUint64(ext, uint64(length))
-		header = append(header, ext...)
+		return fmt.Sprintf("Unknown(%d)", mt)
 	}
-	if _, err := w.Write(header); err != nil {
-		return err
-	}
-	if length > 0 {
-		if _, err := w.Write(payload); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
-func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/ws", wsHandler)
-	mux.HandleFunc("/", httpHandler)
-
-	srv := &http.Server{
-		Addr:         ":8080",
-		Handler:      mux,
-		ReadTimeout:  5 * time.Second,
-		WriteTimeout: 10 * time.Second,
+func splitHostPort(remote string) (ip, port string) {
+	host, p, err := net.SplitHostPort(remote)
+	if err != nil {
+		return remote, ""
 	}
+	return host, p
+}
 
-	log.Printf("Server listening on %s", srv.Addr)
-	if err := srv.ListenAndServe(); err != nil {
-		log.Fatalf("Server error: %v", err)
+func getEnv(k, def string) string {
+	if v := os.Getenv(k); v != "" {
+		return v
 	}
+	return def
 }
